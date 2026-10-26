@@ -4,26 +4,28 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Projeksiyon IPTV - Ultra Hafif</title>
-    <!-- ZORUNLU DEĞİŞİKLİK: Daha az RAM tüketen "Light" sürümü -->
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.light.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.light.min.js"></script>
     <style>
         body, html {
             margin: 0; padding: 0; width: 100%; height: 100%;
-            background-color: black; overflow: hidden; font-family: sans-serif;
+            background-color: #000; overflow: hidden; font-family: sans-serif;
         }
         video {
             width: 100%; height: 100%; object-fit: contain; outline: none;
+            background-color: #000;
         }
         #playOverlay {
             position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(0,0,0,0.9); display: flex;
+            background-color: #000; display: flex;
             justify-content: center; align-items: center; z-index: 10;
         }
-        /* ZORUNLU DEĞİŞİKLİK: GPU yoran gölge ve efektler kaldırıldı */
         #playButton {
-            padding: 20px 40px; font-size: 24px; font-weight: bold;
-            background-color: #333; color: white; border: 2px solid #555;
-            border-radius: 4px; cursor: pointer; outline: none;
+            padding: 18px 36px; font-size: 22px; font-weight: bold;
+            background-color: #222; color: #fff; border: 2px solid #666;
+            cursor: pointer; outline: none;
+        }
+        #playButton:focus {
+            border-color: #fff; background-color: #444;
         }
     </style>
 </head>
@@ -33,73 +35,181 @@
         <button id="playButton" tabindex="1">YAYINI BAŞLAT</button>
     </div>
 
-    <!-- playsinline eklendi, tarayıcıyı yormaması için -->
-    <video id="videoPlayer" controls playsinline></video>
+    <!-- preload="none" ve x-webkit-airplay donanım hızlandırmayı destekler -->
+    <video id="videoPlayer" controls playsinline webkit-playsinline preload="none"></video>
 
     <script>
         var video = document.getElementById('videoPlayer');
         var overlay = document.getElementById('playOverlay');
         var playBtn = document.getElementById('playButton');
         var videoSrc = '/stream/yeni-kanal';
+        var hls = null;
+        var cleanupTimer = null;
+        var lastRecoverTime = 0;
 
-        window.onload = function() { playBtn.focus(); };
+        window.onload = function() {
+            if (playBtn) playBtn.focus();
+        };
 
         function startStream() {
-            overlay.style.display = 'none';
-
-            if (video.requestFullscreen) {
-                video.requestFullscreen().catch(err => console.log(err));
-            } else if (video.webkitRequestFullscreen) {
-                video.webkitRequestFullscreen();
+            // 1. Katmanı gizlemek yerine DOM'dan tamamen silerek RAM açıyoruz
+            if (overlay && overlay.parentNode) {
+                overlay.parentNode.removeChild(overlay);
+                overlay = null;
+                playBtn = null;
             }
 
-            if (Hls.isSupported()) {
-                // 1 GB RAM İÇİN "AŞIRI SIKI" DİYET AYARLARI
-                var hlsConfig = {
-                    maxBufferSize: 2 * 1024 * 1024,  // Maksimum RAM kullanımı sadece 2 MB!
-                    maxBufferLength: 4,              // Sadece 4 saniye ileriyi yükle
-                    maxMaxBufferLength: 5,           // Ne olursa olsun tampon 5 saniyeyi geçmesin
-                    backBufferLength: 0,             // EN ÖNEMLİSİ: İzlenmiş geçmişi anında bellekten sil
-                    liveSyncDurationCount: 2,        // Canlıya olabildiğince yakın tut
-                    liveMaxLatencyDurationCount: 5,  // Takılma olursa eski paketleri RAM'e almadan direkt atla
-                    enableWorker: true,              // İşlemleri arka plana at, sekmeyi dondurma
-                    capLevelToPlayerSize: true       // 1080p gelse bile cihazın ekranına göre optimize etmeye çalış
-                };
+            // Tam ekran isteği (Hata verirse sessizce geç)
+            try {
+                if (video.requestFullscreen) {
+                    video.requestFullscreen().catch(function(){});
+                } else if (video.webkitRequestFullscreen) {
+                    video.webkitRequestFullscreen();
+                } else if (video.webkitEnterFullscreen) {
+                    video.webkitEnterFullscreen();
+                }
+            } catch (e) {}
 
-                var hls = new Hls(hlsConfig);
-                hls.loadSource(videoSrc);
-                hls.attachMedia(video);
-                
-                hls.on(Hls.Events.MANIFEST_PARSED, function() {
-                    video.play();
-                });
-
-                hls.on(Hls.Events.ERROR, function (event, data) {
-                    if (data.fatal) {
-                        switch (data.type) {
-                            case Hls.ErrorTypes.MEDIA_ERROR:
-                                console.log('Medya hatası, RAM boşaltılıp kurtarılıyor...');
-                                hls.recoverMediaError();
-                                break;
-                            case Hls.ErrorTypes.NETWORK_ERROR:
-                                hls.startLoad();
-                                break;
-                            default:
-                                hls.destroy();
-                                break;
-                        }
-                    }
-                });
-            } 
-            else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            // 2. ÖNCELİK: Cihazın kendi donanımsal HLS oynatıcısı (Sıfıra yakın tarayıcı RAM'i kullanır)
+            if (video.canPlayType('application/vnd.apple.mpegurl') || video.canPlayType('application/x-mpegURL')) {
                 video.src = videoSrc;
-                video.play();
+                video.addEventListener('loadedmetadata', function() {
+                    video.play().catch(function(){});
+                }, { once: true });
+
+                // Eğer cihaz "destekliyorum" deyip oynatamazsa HLS.js'e düş (Fallback)
+                video.addEventListener('error', function() {
+                    initHlsJs();
+                }, { once: true });
+            } 
+            // 3. YEDEK: Donanımsal destek yoksa optimize edilmiş HLS.js kullan
+            else {
+                initHlsJs();
             }
         }
 
+        function initHlsJs() {
+            if (!window.Hls || !Hls.isSupported()) return;
+
+            var hlsConfig = {
+                // KRİTİK: Worker kapalı! İkinci bir JS motoru açıp RAM'i ikiye katlamasını önler
+                enableWorker: false,
+                
+                // Tek bir TS paketinin sığabileceği gerçekçi minimum sınırlar (Çökme döngüsünü önler)
+                maxBufferSize: 6 * 1024 * 1024,  // 6 MB (1080p tek paket sığması için güvenli alt sınır)
+                maxBufferLength: 6,              // İleriye dönük maksimum 6 saniye tut
+                maxMaxBufferLength: 10,          // Tavan tampon 10 saniye
+                backBufferLength: 0,             // İzlenen kısmı tutma
+                
+                // Canlı yayın senkronizasyonu
+                liveSyncDurationCount: 2,
+                liveMaxLatencyDurationCount: 5,
+                maxLiveSyncPlaybackRate: 1.1,    // Geride kalırsa hafif hızlandırarak yetiş
+                
+                // Kalite ve Bellek Koruma
+                capLevelToPlayerSize: true,
+                startLevel: 0,                   // İlk açılışta en hafif kaliteden başla, RAM'i şoklama
+                abrMaxWithRealBitrate: true,
+                
+                // Gereksiz altyazı/metin tamponlarını tamamen kapat
+                enableWebVTT: false,
+                enableIMSC1: false,
+                enableCEA708Captions: false
+            };
+
+            hls = new Hls(hlsConfig);
+            hls.loadSource(videoSrc);
+            hls.attachMedia(video);
+
+            hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {
+                // Çoklu kalite varsa en yüksek 720p/orta seviyeye sabitlemek için (opsiyonel koruma)
+                if (data.levels && data.levels.length > 2) {
+                    hls.autoLevelCapping = data.levels.length - 2;
+                }
+                video.play().catch(function(){});
+            });
+
+            // 4. ESKİ WEBVIEW İÇİN MANUEL BELLEK SÜPÜRÜCÜ
+            // Bazı eski Android WebView'lar backBufferLength:0 ayarını yoksayar.
+            // Her 10 saniyede bir, geride kalan video tamponunu zorla temizliyoruz.
+            cleanupTimer = setInterval(function() {
+                if (!video || video.paused) return;
+                try {
+                    var currentTime = video.currentTime;
+                    if (currentTime > 6 && video.buffered.length > 0) {
+                        // Video 6. saniyeyi geçtiyse, mevcut zamandan 3 saniye öncesini sil
+                        if (hls && hls.bufferController && hls.bufferController.sourceBuffer) {
+                            var sb = hls.bufferController.sourceBuffer;
+                            for (var type in sb) {
+                                if (sb[type] && !sb[type].updating) {
+                                    sb[type].remove(0, currentTime - 3);
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {}
+            }, 10000);
+
+            // 5. KORUMALI HATA KURTARMA (Sonsuz bellek sızıntısı döngüsünü engeller)
+            hls.on(Hls.Events.ERROR, function(event, data) {
+                if (data.fatal) {
+                    var now = Date.now();
+                    switch (data.type) {
+                        case Hls.ErrorTypes.MEDIA_ERROR:
+                            // Sadece 5 saniyede bir kurtarmaya izin ver (RAM şişmesini engeller)
+                            if (now - lastRecoverTime > 5000) {
+                                lastRecoverTime = now;
+                                hls.recoverMediaError();
+                            } else {
+                                // Kurtarma işe yaramıyorsa oynatıcıyı sıfırla
+                                restartPlayer();
+                            }
+                            break;
+                        case Hls.ErrorTypes.NETWORK_ERROR:
+                            setTimeout(function() {
+                                if (hls) hls.startLoad();
+                            }, 2000);
+                            break;
+                        default:
+                            restartPlayer();
+                            break;
+                    }
+                }
+            });
+        }
+
+        function restartPlayer() {
+            destroyPlayer();
+            setTimeout(initHlsJs, 1500);
+        }
+
+        function destroyPlayer() {
+            if (cleanupTimer) {
+                clearInterval(cleanupTimer);
+                cleanupTimer = null;
+            }
+            if (hls) {
+                hls.destroy();
+                hls = null;
+            }
+            if (video) {
+                video.removeAttribute('src');
+                video.load();
+            }
+        }
+
+        // Sayfadan çıkılırken tüm RAM'i işletim sistemine iade et
+        window.addEventListener('beforeunload', destroyPlayer);
+        window.addEventListener('pagehide', destroyPlayer);
+
         playBtn.addEventListener('click', startStream);
         playBtn.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter' || e.keyCode === 13) startStream();
+            var code = e.keyCode || e.which;
+            // 13: Standart Enter, 23: Android TV Kumanda Orta Tuş (DPAD_CENTER), 66: Android Enter
+            if (e.key === 'Enter' || code === 13 || code === 23 || code === 66) {
+                e.preventDefault();
+                startStream();
+            }
         });
     </script>
 
