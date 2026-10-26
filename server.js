@@ -2,13 +2,26 @@ const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const path = require('path');
+const http = require('http');
+const https = require('https');
+const { pipeline } = require('stream');
 
 const app = express();
 app.use(cors());
 
+// --- BELLEK DOSTU BAĞLANTI HAVUZU (Keep-Alive) ---
+// Her .ts parçası için yeni soket açıp RAM şişirmesini engeller
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 30, maxFreeSockets: 5 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 30, maxFreeSockets: 5 });
+
+const axiosInstance = axios.create({
+    httpAgent,
+    httpsAgent,
+    timeout: 10000 // 10 saniyede yanıt vermeyen asılı bağlantıları öldür
+});
+
 // --- ORTAK FONKSİYONLAR ---
 
-// M3U8 dosyasının içindeki .ts linklerini bizim proxy'e yönlendiren fonksiyon
 function rewriteM3u8(m3u8Content, baseUrl) {
     return m3u8Content.split('\n').map(line => {
         const trimmedLine = line.trim();
@@ -36,14 +49,25 @@ const batutestHeaders = {
     'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
 };
 
-// Ortak yayın çekme fonksiyonu (Her iki endpoint de aynı yayını verir)
+// M3U8 için 1.5 saniyelik mini RAM önbelleği (Aynı anda birden fazla istek gelirse sunucuyu yormaz)
+let m3u8Cache = { data: null, timestamp: 0 };
+
 async function handleStreamRequest(req, res) {
     try {
-        const response = await axios.get(STREAM_URL, {
+        const now = Date.now();
+        if (m3u8Cache.data && (now - m3u8Cache.timestamp < 1500)) {
+            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+            return res.send(m3u8Cache.data);
+        }
+
+        const response = await axiosInstance.get(STREAM_URL, {
             headers: batutestHeaders,
             responseType: 'text'
         });
+
         const rewrittenM3u8 = rewriteM3u8(response.data, BASE_URL);
+        m3u8Cache = { data: rewrittenM3u8, timestamp: now };
+
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(rewrittenM3u8);
     } catch (error) {
@@ -52,11 +76,10 @@ async function handleStreamRequest(req, res) {
     }
 }
 
-// Her iki adresten de aynı yayına erişebilirsiniz (index.html bozulmasın diye ikisi de aktif)
 app.get('/stream/batutest.m3u8', handleStreamRequest);
 app.get('/stream/yeni-kanal', handleStreamRequest);
 
-// --- ORTAK TS PROXY (Video Parçacıkları İçin) ---
+// --- BELLEK SIZINTISI KORUMALI TS PROXY ---
 app.get('/ts-proxy', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('URL eksik.');
@@ -65,15 +88,39 @@ app.get('/ts-proxy', async (req, res) => {
         ? batutestHeaders 
         : { 'User-Agent': 'Mozilla/5.0' };
 
+    // İstemci bağlantıyı koparırsa Axios isteğini anında iptal etmek için
+    const controller = new AbortController();
+
+    req.on('close', () => {
+        if (!res.writableEnded) {
+            controller.abort();
+        }
+    });
+
     try {
-        const response = await axios.get(targetUrl, {
+        const response = await axiosInstance.get(targetUrl, {
             headers: headersToUse,
-            responseType: 'stream'
+            responseType: 'stream',
+            signal: controller.signal,
+            decompress: false // Video verisini sıkıştırma/açma ile RAM harcama
         });
+
         res.setHeader('Content-Type', 'video/MP2T');
-        response.data.pipe(res);
+        res.setHeader('Cache-Control', 'public, max-age=60');
+
+        // pipeline() hata veya kopma durumunda stream'leri otomatik yok eder (destroy) ve RAM'i temizler
+        pipeline(response.data, res, (err) => {
+            if (err && err.code !== 'ERR_STREAM_PREMATURE_CLOSE') {
+                // İstemci ayrıldığında oluşan normal kapanmaları loglayıp şişirme
+            }
+            if (response.data && !response.data.destroyed) {
+                response.data.destroy();
+            }
+        });
     } catch (error) {
-        res.status(500).send('TS dosyası alınamadı.');
+        if (!axios.isCancel(error) && !res.headersSent) {
+            res.status(500).send('TS dosyası alınamadı.');
+        }
     }
 });
 
