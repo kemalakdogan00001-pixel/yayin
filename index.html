@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Projeksiyon IPTV - Ultra Hafif</title>
+    <!-- ZORUNLU DEĞİŞİKLİK: Daha az RAM tüketen "Light" sürümü -->
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.light.min.js"></script>
+    <style>
+        body, html {
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            background-color: black; overflow: hidden; font-family: sans-serif;
+        }
+        video {
+            width: 100%; height: 100%; object-fit: contain; outline: none;
+        }
+        #playOverlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.9); display: flex;
+            justify-content: center; align-items: center; z-index: 10;
+        }
+        /* ZORUNLU DEĞİŞİKLİK: GPU yoran gölge ve efektler kaldırıldı */
+        #playButton {
+            padding: 20px 40px; font-size: 24px; font-weight: bold;
+            background-color: #333; color: white; border: 2px solid #555;
+            border-radius: 4px; cursor: pointer; outline: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="playOverlay">
+        <button id="playButton" tabindex="1">YAYINI BAŞLAT</button>
+    </div>
+
+    <!-- playsinline eklendi, tarayıcıyı yormaması için -->
+    <video id="videoPlayer" controls playsinline></video>
+
+    <script>
+        var video = document.getElementById('videoPlayer');
+        var overlay = document.getElementById('playOverlay');
+        var playBtn = document.getElementById('playButton');
+        var videoSrc = '/stream/yeni-kanal';
+
+        window.onload = function() { playBtn.focus(); };
+
+        function startStream() {
+            overlay.style.display = 'none';
+
+            if (video.requestFullscreen) {
+                video.requestFullscreen().catch(err => console.log(err));
+            } else if (video.webkitRequestFullscreen) {
+                video.webkitRequestFullscreen();
+            }
+
+            if (Hls.isSupported()) {
+                // 1 GB RAM İÇİN "AŞIRI SIKI" DİYET AYARLARI
+                var hlsConfig = {
+                    maxBufferSize: 2 * 1024 * 1024,  // Maksimum RAM kullanımı sadece 2 MB!
+                    maxBufferLength: 4,              // Sadece 4 saniye ileriyi yükle
+                    maxMaxBufferLength: 5,           // Ne olursa olsun tampon 5 saniyeyi geçmesin
+                    backBufferLength: 0,             // EN ÖNEMLİSİ: İzlenmiş geçmişi anında bellekten sil
+                    liveSyncDurationCount: 2,        // Canlıya olabildiğince yakın tut
+                    liveMaxLatencyDurationCount: 5,  // Takılma olursa eski paketleri RAM'e almadan direkt atla
+                    enableWorker: true,              // İşlemleri arka plana at, sekmeyi dondurma
+                    capLevelToPlayerSize: true       // 1080p gelse bile cihazın ekranına göre optimize etmeye çalış
+                };
+
+                var hls = new Hls(hlsConfig);
+                hls.loadSource(videoSrc);
+                hls.attachMedia(video);
+                
+                hls.on(Hls.Events.MANIFEST_PARSED, function() {
+                    video.play();
+                });
+
+                hls.on(Hls.Events.ERROR, function (event, data) {
+                    if (data.fatal) {
+                        switch (data.type) {
+                            case Hls.ErrorTypes.MEDIA_ERROR:
+                                console.log('Medya hatası, RAM boşaltılıp kurtarılıyor...');
+                                hls.recoverMediaError();
+                                break;
+                            case Hls.ErrorTypes.NETWORK_ERROR:
+                                hls.startLoad();
+                                break;
+                            default:
+                                hls.destroy();
+                                break;
+                        }
+                    }
+                });
+            } 
+            else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                video.src = videoSrc;
+                video.play();
+            }
+        }
+
+        playBtn.addEventListener('click', startStream);
+        playBtn.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' || e.keyCode === 13) startStream();
+        });
+    </script>
+
+</body>
+</html>
